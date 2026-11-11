@@ -1,0 +1,657 @@
+---
+title: "Proyecto_2do_Parcial"
+author: "Manuel_Mares"
+lang: es
+format:
+  html:
+    toc: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+### Modelo que se utilizara
+
+$$\ln(Y_{i,t}) = \beta_0 + \beta_1 \ln(USDMXN_i) + \beta_2 \ln(SPX_i) + \beta_3 \, Tasa1A_i + u_i$$
+
+# El primer paso que debemos hacer es descargar y verificar los datos
+
+Mateo-
+
+El primer paso que debemos hacer es descargar y verificar los datos
+
+Necesitamos descargar unos packages para la ejecución del código Una vez con esto establecemos los parámetros, el nivel de significancia a 0.05 y las tres acciones OMAB, LABB y S&P500 Vamos a generar un atabla con fechas y los últimos precios de cada acción de 226, comparados con los primeros datos recuperados de 2024.
+
+```{r}
+#| label: paso1
+paquetes <- c("readxl", "car", "lmtest", "ggplot2", "knitr")
+faltan <- paquetes[!paquetes %in% rownames(installed.packages())]
+if (length(faltan) > 0) install.packages(faltan)
+invisible(lapply(paquetes, library, character.only = TRUE))
+
+archivo <- "DATA_clean.xlsx"
+alfa    <- 0.05                      # nivel de significancia (IC al 95%)
+activos <- c("OMAB", "LABB", "NVDA")
+dir.create("output", showWarnings = FALSE)
+
+# Datos en A2:K25 (24 cierres mensuales); los nombres van en la fila 26 del Excel
+raw <- as.data.frame(read_excel(archivo, range = "A2:K25", col_names = FALSE))
+names(raw) <- c("Fecha", "OMAB", "LABB", "Tasa", "TUM26", "EURMXN",
+                "USDMXN", "SOLANA", "SPX", "INMX", "NVDA")
+
+if (inherits(raw$Fecha, c("POSIXct", "Date"))) {
+  raw$Fecha <- as.Date(raw$Fecha)
+} else {
+  raw$Fecha <- as.Date(as.character(raw$Fecha), format = "%d.%m.%Y")
+}
+raw[, -1] <- lapply(raw[, -1], as.numeric)
+
+datos <- raw[order(raw$Fecha), c("Fecha", "OMAB", "LABB", "NVDA",
+                                 "USDMXN", "SPX", "Tasa")]
+rownames(datos) <- NULL
+stopifnot(nrow(datos) == 24, !anyNA(datos))
+
+head(datos, 3)
+tail(datos, 3)
+```
+
+Aqui podemos observar que tenemos 24 filas, del 2024-06-01 al 2026-05-01. Primera fila: OMAB = 155.16; última: OMAB = 256.90, Tasa = de 10.99 a 7.24.
+
+# Paso 2. Ahora debemos transformar y explorar los datos
+
+Mateo: Para leer los coeficientes en porcentaje necesitamos transformar la ecuación del modelo a logarítmos. Después necesitamos conocer el comportamiento de nuestras variables, por lo que debemos calcular la media, la desviación estándar y que tan dispersos están los datos. Una vez hecho esto vemos si lo factores se relacionan con el precio de cada acción. Detectar si existe multicolinealidad entre las variables.
+
+```{r}
+# Aqui estamos convirtiendo las variables en log
+d <- data.frame(
+  Fecha = datos$Fecha,
+  lOMAB = log(datos$OMAB),
+  lLABB = log(datos$LABB),
+  lNVDA = log(datos$NVDA),
+  lUSDMXN = log(datos$USDMXN),
+  lSPX = log(datos$SPX),
+  Tasa = datos$Tasa
+)
+vars <- c("OMAB", "LABB", "NVDA", "USDMXN", "SPX", "Tasa")
+T1 <- data.frame(
+  Variable = vars,
+  Media    = unname(sapply(datos[vars], mean)),
+  DesvEst  = unname(sapply(datos[vars], sd)),
+  Minimo   = unname(sapply(datos[vars], min)),
+  Maximo   = unname(sapply(datos[vars], max))
+)
+kable(T1, digits = 2, caption = "T1. Estadísticos descriptivos")
+
+T2 <- data.frame(Variable = names(d)[-1], round(cor(d[, -1]), 3), row.names = NULL)
+kable(T2, caption = "T2. Correlaciones (variables transformadas)")
+
+z <- as.data.frame(scale(datos[vars]))
+largo <- data.frame(
+  Fecha = rep(datos$Fecha, times = length(vars)),
+  Serie = rep(vars, each = nrow(datos)),
+  Valor = unlist(z, use.names = FALSE)
+)
+F1 <- ggplot(largo, aes(Fecha, Valor, color = Serie)) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "Series estandarizadas", x = NULL, y = "Valor estandarizado") +
+  theme_minimal()
+ggsave("output/F1_series_estandarizadas.png", F1, width = 8, height = 4.5, dpi = 300)
+F1
+```
+
+Una vez hecho esto vemos si lo factores se relacionan con el precio de cada acción. Detectar si existe multicolinealidad entre las variables. Aqui en la gráfica podremos observar varias cosas; primewro, la tasa de México baja continuamente durante todo el preiodo; S&P, OMAB y NVDIA tienden a subir a lo largo del periodo y además USD/MXN y LABB permanecen muy juntras durante todo el periodo. Hay tendencias comunes,po rlo que existe el riesgo de una regresión espuria, además la tasa comoel S&p 500 se mueven en direcciones totalmente opouestas, desde aquí obtenemos un indicio de una posible multicolinealidad.
+
+```{r}
+round(cor(d$lOMAB, d$Tasa), 3)   
+round(cor(d$lNVDA, d$Tasa), 3)   
+```
+
+De acuerdo con los resultados obtenidos podemos encontrar que existe un amulticolinealidad moeradda con S&P 500, aunque esta no supera el umbral de 0.05 desde que tenemos una base de datos de 24 observaciobnes puede implicar significativamente. Po esto, los errores estándar de S&P 500 y de la tasa se inflan, causando que por separado casi no tengan un impacto significativo.
+
+# Parte 3 Estimaremos los 3 modelo por MCO
+
+Mario: Aqui lo que hice fue estimar un modelo por acción con la misma especificacion.
+
+```{r}
+formula_niv <- function(a) as.formula(paste0("l", a, " ~ lUSDMXN + lSPX + Tasa"))
+modelos <- lapply(activos, function(a) lm(formula_niv(a), data = d))
+names(modelos) <- activos
+
+summary(modelos$OMAB)
+summary(modelos$LABB)
+summary(modelos$NVDA)
+
+```
+
+Aqui se estimó un modelo por acción con la misma especificación: $\ln(P_{a}) = \beta_0 + \beta_1 \ln(USDMXN) + \beta_2 \ln(SPX) + \beta_3 Tasa + \varepsilon$. Los coeficientes de `lUSDMXN` y `lSPX` son **elasticidades** y el de `Tasa` es una **semielasticidad**.
+
+| Acción | lUSDMXN | lSPX | Tasa | R² ajustado | F (p-value) |
+|------------|------------|------------|------------|------------|------------|
+| OMAB | -0.166 | -0.577 (.) | -0.152 (\*\*\*) | 0.8885 | 62.09 (2.6e-10) |
+| LABB | 3.007 (\*\*\*) | 0.045 | -0.019 | 0.8296 | 38.33 (1.8e-08) |
+| NVDA | -0.627 (.) | 2.098 (\*\*\*) | 0.012 | 0.9035 | 72.75 (6.2e-11) |
+
+*Significancia: \*\*\* 0.001, \*\* 0.01, \* 0.05, . 0.1.*
+
+### OMAB
+
+La **tasa de interés** es el único factor significativo al 1% (p \< 0.001). con un aumento de un punto porcentual en la tasa se asocia con una caída de aproximadamente 14% en el precio, manteniendo constantes los demás factores. El S&P 500 resulta significativo solo al 10% y con signo negativo, un resultado débil que debe tomarse con cautela. El tipo de cambio no es significativo. El modelo explica cerca del 89% de la variación del precio (R² ajustado = 0.8885).
+
+### LABB
+
+El **tipo de cambio** es el factor dominante: con un aumento de 1% en el USDMXN se asocia con un aumento de aproximadamente 3% en el precio. Esto nos dice que la acción se beneficia de la depreciación del peso, por ejemplo por los ingresos de la moneda extranjera. El S&P 500 y la tasa no son significativos. Es el modelo con menor ajuste (R² ajustado = 0.8296), aunque sigue siendo alto.
+
+### NVDA
+
+El **S&P 500** es el factor determinante: con un aumento de 1% en el índice se asocia con un aumento de aproximadamente 2.1% en el precio, esto quiere decir que, la acción amplifica los movimientos del mercado . El tipo de cambio es significativo solo al 10% y su interpretación económica es poco clara para una acción estadounidense; la tasa no es significativa. Es el mejor ajuste de los tres (R² ajustado = 0.9035).
+
+Como podemos interpretar esto mas o menos:
+
+- `Estimate`: Es el coeficiente. En `lUSDMXN` y `lSPX` es una **elasticidad**; en `Tasa` es una **semielasticidad**.
+- `Std. Error`, `t value` y `Pr(>|t|)`: Es laprueba t de H0: β = 0. Un p menor a 0.05 significa que el factor es significativo al 5%.
+- `Multiple R-squared` y `Adjusted R-squared`: ajuste del modelo.
+- `F-statistic` y su `p-value`: prueba F global (H0: todos los β de los factores son cero).
+
+# Paso 4 Tabla donde analizaremos los coeficientes y ajustes
+
+- Aqui es donde sucede nuestro objetivo general
+
+Mares: Aqui junte en una tabla los coeficiente, erroes estanda , p-valores e intervalos de confianza al 95% de los tres , modelos, mas el R^2^ y la prueba F globlal- Tambien calcule el efecto exacto en el precio por cada punto porcentual de la tasa.
+
+```{r}
+#| label: paso4
+tabla_coef <- function(m, activo) {
+  s  <- summary(m)$coefficients
+  ic <- confint(m, level = 1 - alfa)
+  data.frame(Activo = activo, Variable = rownames(s),
+             Coef = s[, 1], EE = s[, 2], t = s[, 3], p = s[, 4],
+             IC_inf = ic[, 1], IC_sup = ic[, 2], row.names = NULL)
+}
+```
+
+Definimos la funcion que se llevara acabo en la tabla de los coeficientes, columnas, filas, etc.
+
+```{r}
+tabla_ajuste <- function(lista) {
+  do.call(rbind, lapply(names(lista), function(a) {
+    s <- summary(lista[[a]]); f <- s$fstatistic
+    data.frame(Activo = a, R2 = s$r.squared, R2_ajustado = s$adj.r.squared,
+               F_global = unname(f["value"]), gl1 = unname(f["numdf"]),
+               gl2 = unname(f["dendf"]),
+               p_F = unname(pf(f["value"], f["numdf"], f["dendf"], lower.tail = FALSE)),
+               n = nobs(lista[[a]]))
+  }))
+}
+```
+
+Ahora los mismo que con la anterior tabla definimos la funcion que se llevara acabo en la tabla de los coeficientes, columnas, filas, etc.
+
+```{r}
+T3 <- do.call(rbind, lapply(activos, function(a) tabla_coef(modelos[[a]], a)))
+T3$Efecto_pct_1pp <- ifelse(T3$Variable == "Tasa", 100 * (exp(T3$Coef) - 1), NA)
+T3b <- tabla_ajuste(modelos)
+
+kable(T3, digits = 4, caption = "T3. Coeficientes (niveles)")
+kable(T3b, digits = 4, caption = "T3b. Ajuste de los modelos")
+```
+
+## ¿Que variable afecta a las acciones?
+
+Tenemos tres empresas:
+
+- OMAB: Grupo Aeroportuario del Centro Norte.
+
+- LABB: Genomma Lab.
+
+- NVDA: NVIDIA.
+
+Queremos descubrir si el precio de sus acciones cambio dependiendo de tres factores:
+
+| Variable | Explicación |
+|------------------------------------|------------------------------------|
+| IUSDMXN | Es el precio del dólar en pesos mexicanos. |
+| ISPX | Representa cómo se comportan las empresas más importantes de Estados Unidos en la bolsa. |
+| Tasa | Es la tasa de interés, es decir, cuánto cuesta pedir dinero prestado o cuánto podemos ganar al ahorrar. |
+
+Es como preguntarnos: ¿si sube el dólar, las acciones de estas empresas suben o bajan? ¿Qué pasa si la bolsa estadounidense mejora? ¿Y si suben las tasas de interés?
+
+## ¿Qué significa cada columna?
+
+Esta es la parte más importante para entender la primera tabla.
+
+| Columna | Explicación sencilla |
+|------------------------------------|------------------------------------|
+| Activo | Es la empresa que estamos estudiando. |
+| Variable | Es el factor que queremos investigar. |
+| Coef | Nos dice si ese factor hace que el precio suba o baje y cuánto cambia. |
+| EE | Nos dice qué tanta incertidumbre tenemos en nuestra estimación. |
+| t | Es un número que nos ayuda a comprobar si el resultado es suficientemente diferente de cero. |
+| p | Nos ayuda a saber si el resultado es estadísticamente significativo. |
+| IC_inf | Es el límite inferior del intervalo de confianza. |
+| IC_sup | Es el límite superior del intervalo de confianza. |
+| Efecto_pct_1pp | Nos muestra el efecto porcentual estimado cuando la tasa aumenta un punto porcentual. |
+
+El coeficiente es como un termómetro: nos indica si algo está empujando el precio hacia arriba o hacia abajo.
+
+- Si es positivo (+), el precio tiende a subir.
+
+- Si es negativo (-), el precio tiende a bajar.
+
+- Si está cerca de cero, el efecto estimado es pequeño.
+
+## ¿Qué descubrimos en cada empresa?
+
+1.  OMAB (Grupo Aeroportuario del Centro Norte)
+
+Resultado significativo
+
+- El dólar tiene un coeficiente de -0.1657, pero no es significativo.
+
+- El S&P 500 tiene un coeficiente de -0.5765; tampoco alcanza significancia al 5%.
+
+- La tasa tiene un coeficiente de -0.1515 y sí es significativa.
+
+¿Qué significa?
+
+En nuestros resultados, cuando aumenta la tasa de interés, OMAB tiende a disminuir su valor, manteniendo constantes los otros factores.
+
+2.  LABB (Genomma Lab)
+
+Resultado significativo
+
+- El dólar tiene un coeficiente de +3.0071 y es significativo.
+
+- El S&P 500 no presenta un efecto estadísticamente significativo.
+
+- La tasa tampoco presenta un efecto significativo.
+
+¿Qué significa?
+
+Cuando aumenta el valor del dólar, Genomma Lab tiende a aumentar su valor según nuestro modelo, manteniendo constantes los demás factores.
+
+NVDA (NVIDIA)
+
+Resultado significativo
+
+- El dólar tiene un coeficiente negativo, pero no es significativo al 5%.
+
+- El S&P 500 tiene un coeficiente de +2.0980 y es significativo.
+
+- La tasa tampoco presenta un efecto significativo.
+
+¿Qué significa?
+
+Cuando mejora el comportamiento del S&P 500, NVIDIA tiende a aumentar su valor según nuestro modelo.
+
+Es la respuesta central al **objetivo general**: cuánto y en qué sentido responde cada precio a los tres factores. Los p-valores aportan al objetivo particular 1 (qué factores son relevantes) y los intervalos al objetivo particular 3 (qué tan precisas son las estimaciones). El patrón que aparece es que cada acción responde sobre todo a un factor distinto: OMAB a la tasa, LABB al tipo de cambio y NVDA al S&P 500.
+
+## Ajuste de los modelos
+
+La segunda tabla nos dice qué tan bien nuestro modelo logra explicar los movimientos de las acciones.
+
+| Columna | Explicación |
+|------------------------------------|------------------------------------|
+| R2 | Qué porcentaje de los cambios de la acción logra explicar nuestro modelo. |
+| R2_ajustado | Una versión del R² que toma en cuenta cuántas variables utilizamos. |
+| F_global | Nos ayuda a evaluar si el modelo completo sirve para explicar algo. |
+| gl1 y gl2 | Son grados de libertad, números que se utilizan para realizar la prueba estadística. |
+| p_F | Nos dice si el modelo completo es estadísticamente significativo. |
+| n | Es la cantidad de observaciones que utilizamos. |
+
+### ¿Cómo interpretamos el R²?
+
+OMAB= 90.30%
+
+R²:El modelo explica aproximadamente el 90.3% de los movimientos de OMAB.
+
+LABB=85.18%
+
+R²: El modelo explica aproximadamente el 85.18% de los movimientos de LABB.
+
+NVDA=91.61%
+
+R²:El modelo explica aproximadamente el 91.61% de los movimientos de NVIDIA
+
+## Hallazgo
+
+Calculamos cuánto cambiaría el valor de cada acción si la tasa de interés aumentara un punto porcentual. Sin embargo, debemos tener cuidado: aunque encontramos porcentajes negativos y positivos, no todos son estadísticamente significativos. Por ejemplo, OMAB presenta una disminución estimada de aproximadamente 14.06%, y este resultado sí es significativo. En cambio, para Genomma Lab estimamos una disminución de 1.90%, pero no tenemos suficiente evidencia estadística para asegurar que realmente ocurra
+
+# Paso 5. Pruebas de hipotesis.
+
+- Objetivo particular 1
+
+Mario. Ademas de que ya hicimos las pruebas t, vamos a contrastar si un solo factor basta para cada acción y si NVDA se mueve igual que el mercado (H0: β_SPX = 1).
+
+```{r}
+#| label: paso5
+hipotesis <- list(
+  "Basta Tasa (H0: USDMXN = SPX = 0)"  = c("lUSDMXN = 0", "lSPX = 0"),
+  "Basta USDMXN (H0: SPX = Tasa = 0)"  = c("lSPX = 0", "Tasa = 0"),
+  "Basta SPX (H0: USDMXN = Tasa = 0)"  = c("lUSDMXN = 0", "Tasa = 0")
+)
+T4 <- do.call(rbind, lapply(activos, function(a) {
+  do.call(rbind, lapply(names(hipotesis), function(h) {
+    r <- linearHypothesis(modelos[[a]], hipotesis[[h]])
+    data.frame(Activo = a, Hipotesis = h, F = r$F[2], gl1 = r$Df[2],
+               gl2 = r$Res.Df[1], p = r$`Pr(>F)`[2])
+  }))
+}))
+r1 <- linearHypothesis(modelos$NVDA, "lSPX = 1")
+T4 <- rbind(T4, data.frame(Activo = "NVDA", Hipotesis = "H0: beta_SPX = 1",
+                           F = r1$F[2], gl1 = r1$Df[2], gl2 = r1$Res.Df[1],
+                           p = r1$`Pr(>F)`[2]))
+kable(T4, digits = 4, caption = "T4. Pruebas F de restricciones")
+```
+
+Nuestro objetivo con estas pruebas es saber si con un solo factor es suficiente para explicar el precio de cada acción. Para eso se contrasta si los otros dos factores son conjuntamente iguales a cero. Si no se rechaza $H_0$, el factor restante basta por sí solo. Si se rechaza, los factores excluidos sí aportan información y el modelo reducido no es adecuado.
+
+**OMAB.** No se rechaza la hipótesis de que basta la tasa (F = 1.96, p = 0.168), es decir, el tipo de cambio y el S&P 500 no aportan información adicional una vez que se incluye la tasa. En cambio, se rechazan las otras dos hipótesis (p \< 0.001), por lo que ni el tipo de cambio ni el S&P 500 por sí solos explican el precio sin la tasa. Esto coincide con las pruebas t, donde la tasa era el único coeficiente significativo.
+
+**LABB.** Aquí sí se rechaza que baste la tasa (F = 40.91, p \< 0.001) y que baste el S&P 500 (F = 32.98, p \< 0.001). No se rechaza que baste el tipo de cambio (F = 1.12, p = 0.345), lo que indica que el USDMXN es el único factor necesario para esta acción, de acuerdo con su coeficiente de 3.01 en el modelo completo.
+
+**NVDA.** Se rechazan las hipótesis de que basten la tasa (F = 33.47, p \< 0.001) o el tipo de cambio (F = 37.57, p \< 0.001). No se rechaza que baste el S&P 500 (F = 1.71, p = 0.206), por lo que el mercado es el único factor relevante para esta acción.
+
+**Beta de NVDA frente al mercado.** Se contrastó $H_0: \beta_{SPX} = 1$, es decir, si NVDA se mueve en la misma proporción que el S&P 500. La hipótesis se rechaza (F = 10.85, p = 0.0036), así que la beta es estadísticamente distinta de uno. Como la estimación puntual es de 2.10, NVDA no solo sigue al mercado sino que amplifica sus movimientos, lo que la hace una acción más agresiva que el índice.
+
+# Paso 6. Comparar magnitudes.
+
+- Objetivo particular 2
+
+Mario- Como la tasa esta en puntos porcentuales y los otros factores en logaritmos, no podemos compararlo directamente. Y por eso con las variables estandarizadas, el coeficiente indica cuantas desviaciones estandar cambia el precio por cada desviación estandár del factor
+
+```{r}
+#| label: paso6
+dz <- as.data.frame(scale(d[, -1]))
+T8 <- do.call(rbind, lapply(activos, function(a) {
+  m <- lm(formula_niv(a), data = dz)
+  s <- summary(m)$coefficients; ic <- confint(m, level = 1 - alfa)
+  data.frame(Activo = a, Factor = rownames(s)[-1], Beta_est = s[-1, 1],
+             p = s[-1, 4], IC_inf = ic[-1, 1], IC_sup = ic[-1, 2], row.names = NULL)
+}))
+kable(T8, digits = 3, caption = "T8. Betas estandarizados")
+
+F2 <- ggplot(T8, aes(x = Beta_est, y = Factor, color = Activo)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = IC_inf, xmax = IC_sup),
+                  position = position_dodge(width = 0.6)) +
+  labs(title = "Betas estandarizados con IC al 95%", x = "Beta estandarizado", y = NULL) +
+  theme_minimal()
+ggsave("output/F2_betas_estandarizados.png", F2, width = 8, height = 4.5, dpi = 300)
+F2
+```
+
+Como la tasa está en puntos porcentuales y los otros factores en logaritmos, los coeficientes originales no se pueden comparar directamente. Por eso se estandarizaron todas las variables: cada beta indica cuántas desviaciones estándar cambia el precio de la acción cuando el factor se mueve una desviación estándar, manteniendo los demás constantes. Así sí podemos ver cuál factor pesa más en cada acción.
+
+**OMAB.** El factor dominante es la tasa, con un beta de -1.156 (p \< 0.001) y un intervalo de confianza de \[-1.438, -0.875\] que queda lejos del cero. El S&P 500 tiene un efecto mucho menor (-0.294) y solo es significativo al 10% (p = 0.067), y su intervalo incluye al cero. El tipo de cambio es prácticamente nulo (-0.054, p = 0.603). La magnitud de la tasa es casi cuatro veces la del S&P 500, así que el precio de OMAB responde sobre todo a la política monetaria.
+
+**LABB.** El tipo de cambio es el único factor relevante, con un beta de 1.031 (p \< 0.001) e intervalo de \[0.766, 1.296\]. Tanto el S&P 500 (0.024, p = 0.899) como la tasa (-0.153, p = 0.370) tienen intervalos que cruzan el cero, por lo que no podemos distinguirlos de un efecto nulo. Esto coincide con la prueba F del paso anterior, donde el USDMXN bastaba por sí solo para explicar la acción.
+
+**NVDA.** El S&P 500 domina con un beta de 0.887 (p \< 0.001) e intervalo de \[0.593, 1.181\]. El tipo de cambio aparece con un efecto negativo moderado (-0.171) que solo es significativo al 10% (p = 0.090), y la tasa es prácticamente nula (0.074, p = 0.563). De nuevo, el resultado concuerda con la prueba F, donde el mercado era suficiente para explicar el precio.
+
+**Lectura de la gráfica.** En la figura se ve de forma directa lo anterior: un intervalo que no toca la línea punteada del cero indica un factor significativo al 5%. Solo tres intervalos quedan completamente separados del cero: la tasa en OMAB, el tipo de cambio en LABB y el S&P 500 en NVDA. Todos los demás cruzan el cero, de modo que no hay evidencia de que esos factores influyan en el precio.
+
+**Comparación entre acciones.** Una vez puesto todo en la misma escala, vemos que el factor principal de cada acción tiene un peso similar o mayor a una desviación estándar (\|β\| entre 0.89 y 1.16), mientras que el resto de los factores casi nunca supera 0.3. Esto confirma que cada activo está explicado básicamente por un solo factor y que los factores no son intercambiables entre acciones.
+
+# Paso 7. Precisión y escenario.
+
+Mateo Ahora bien, en un caso hipotéti teniendo ya los tres modelos estimados, queremos saber que precio y que margen de error podríamos esperar, es decir, se generará un predicción donde el S%P500 cae un 5% respecto al último dato recuperado, el tipo de cambio queda en 19 y la tasa en México queda de un 8%, con el objetivo de obtyener un apredicción en los precios de cada acción
+
+```{r}
+#| label: paso7
+# Escenario de estrés: S&P 500 -5% vs. el último dato, USD/MXN = 19, Tasa 1A = 8%
+escenario <- list(USDMXN = 19, var_SPX = -0.05, Tasa = 8)
+
+ult <- datos[nrow(datos), ]
+nuevo <- data.frame(
+  lUSDMXN = log(escenario$USDMXN),
+  lSPX    = log(ult$SPX * (1 + escenario$var_SPX)),
+  Tasa    = escenario$Tasa
+)
+
+dentro <- c(
+  USDMXN = escenario$USDMXN >= min(datos$USDMXN) & escenario$USDMXN <= max(datos$USDMXN),
+  SPX    = exp(nuevo$lSPX) >= min(datos$SPX) & exp(nuevo$lSPX) <= max(datos$SPX),
+  Tasa   = escenario$Tasa >= min(datos$Tasa) & escenario$Tasa <= max(datos$Tasa)
+)
+if (!all(dentro)) warning("El escenario sale del rango observado: extrapolación.")
+
+T7 <- do.call(rbind, lapply(activos, function(a) {
+  m  <- modelos[[a]]
+  pm <- predict(m, nuevo, interval = "confidence", level = 1 - alfa)
+  pp <- predict(m, nuevo, interval = "prediction", level = 1 - alfa)
+  data.frame(Activo = a, Ultimo_precio = ult[[a]],
+             Media_inf = exp(pm[1, "lwr"]), Media_est = exp(pm[1, "fit"]),
+             Media_sup = exp(pm[1, "upr"]),
+             Indiv_inf = exp(pp[1, "lwr"]), Indiv_sup = exp(pp[1, "upr"]))
+}))
+T7$Amplitud_media <- T7$Media_sup - T7$Media_inf
+T7$Amplitud_indiv <- T7$Indiv_sup - T7$Indiv_inf
+kable(T7, digits = 1, caption = "T7. Escenario de problematica(Los precios en su unidad original)")
+```
+
+# Parte 8. Diagnosticos del modelo
+
+Mares- Revise multicolinealidad (VIF), autocorrelación (Durbin-Watson), heterocedasticidad(Breush-Pagan) y la normalidad de los residuos (Shapiro-Wilk).
+
+```{r}
+#| label: paso8
+T5 <- do.call(rbind, lapply(activos, function(a) {
+  m  <- modelos[[a]]
+  v  <- vif(m); dw <- dwtest(m); bp <- bptest(m); sw <- shapiro.test(residuals(m))
+  data.frame(Activo = a,
+             VIF_USDMXN = unname(v["lUSDMXN"]), VIF_SPX = unname(v["lSPX"]),
+             VIF_Tasa = unname(v["Tasa"]),
+             DW = unname(dw$statistic), p_DW = dw$p.value,
+             BP = unname(bp$statistic), p_BP = bp$p.value,
+             SW = unname(sw$statistic), p_SW = sw$p.value)
+}))
+kable(T5, digits = 3, caption = "T5. Diagnósticos")
+
+graf_residuos <- function() {
+  par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+  for (a in activos) {
+    m <- modelos[[a]]
+    plot(fitted(m), resid(m), pch = 19, main = paste(a, "- residuos vs ajustados"),
+         xlab = "Valores ajustados", ylab = "Residuos")
+    abline(h = 0, lty = 2)
+  }
+  for (a in activos) {
+    qqnorm(resid(modelos[[a]]), pch = 19, main = paste(a, "- Q-Q de residuos"))
+    qqline(resid(modelos[[a]]))
+  }
+}
+png("output/F3_residuos.png", width = 2400, height = 1500, res = 300)
+graf_residuos()
+dev.off()
+graf_residuos()
+```
+
+## A) Multicolinealidad (VIF)
+
+El VIF nos ayuda a identificar si nuestras variables independientes están demasiado relacionadas entre sí.
+
+¿Cómo interpretamos el VIF?
+
+| Resultado VIF | Interpretación               |
+|---------------|------------------------------|
+| Cerca de 1    | Muy poca multicolinealidad.  |
+| Menor a 5     | Generalmente aceptable.      |
+| Entre 5 y 10  | Puede existir un problema.   |
+| Mayor a 10    | Posible problema importante. |
+
+En la tabla tenemos:
+
+| Variable | VIF   |
+|----------|-------|
+| IUSDMXN  | 2.182 |
+| ISPX     | 4.736 |
+| Tasa     | 3.764 |
+
+Resultado aceptable: Nuestros resultados no muestran un problema grave de multicolinealidad, porque los tres valores están por debajo de 5.
+
+## B) Autocorrelación (Durbin-Watson)
+
+¿Qué significa?
+
+Esatmos estudiando el precio de una acción durante varios meses.
+
+Si el error que cometimos al estimar el precio de enero está relacionado con el error de febrero, podemos tener un problema de autocorrelación. Es decir, los errores de un mes pueden estar relacionados con los errores de meses anteriores.
+
+¿Cómo interpretamos Durbin-Watson?
+
+- Cerca de 2: no hay evidencia importante de autocorrelación.
+
+- Cerca de 0: posible autocorrelación positiva.
+
+- Cerca de 4: posible autocorrelación negativa.
+
+Pero también debemos revisar el valor p para tomar una decisión estadística.
+
+Revisamos:
+
+| Empresa | DW    | Valor p | Interpretación                   |
+|---------|-------|---------|----------------------------------|
+| OMAB    | 1.262 | 0.005   | Hay autocorrelación              |
+| LABB    | 1.910 | 0.191   | Sin evidencia de autocorrelación |
+| NVDA    | 1.360 | 0.010   | Hay autocorrelación              |
+
+¿Qué descubrimos?
+
+- OMAB tiene evidencia de autocorrelación positiva.
+
+- LABB no presenta evidencia estadística suficiente de autocorrelación.
+
+- NVIDIA presenta evidencia de autocorrelación positiva.
+
+Esto significa que los errores de OMAB y NVIDIA parecen estar relacionados entre distintos periodos.
+
+## C) Heterocedasticidad (Breusch-Pagan)
+
+Calculando cuánto se equivocó nuestro modelo al estimar el precio de una acción.
+
+En algunos meses se equivoca poquito y en otros se equivoca muchísimo.
+
+En palabras sencillas: queremos saber si nuestros errores mantienen una variabilidad relativamente constante.
+
+¿Cómo interpretamos el valor p?
+
+- Si p es menor a 0.05: hay evidencia de heterocedasticidad.
+
+- Si p es mayor a 0.05: no hay evidencia suficiente de heterocedasticidad.
+
+Los tres modelos presentan resultados favorables en esta prueba. No encontramos evidencia estadística de que la variabilidad de los errores cambie.
+
+## D) Normalidad de los residuos (Shapiro-Wilk)
+
+La prueba Shapiro-Wilk nos ayuda a comprobar si esos errores siguen aproximadamente una distribución normal, es decir, una forma de campana.
+
+¿Cómo interpretamos el valor p?
+
+- Si p es menor a 0.05: hay evidencia de que los residuos no siguen una distribución normal.
+
+- Si p es mayor a 0.05: no tenemos evidencia suficiente para decir que no son normales.
+
+Los tres modelos cumplen favorablemente esta prueba: no encontramos evidencia estadística suficiente para rechazar la normalidad de sus residuos.
+
+# Parte 9. Robustez con variaciones mensuales.
+
+- Objetivo particular 4
+
+Mares- Aqui repetire los modelo pero con las variaciones que existen mensualmente. Veremos si una asociación proviene solo de tendencias comunes y aqui es donde la desaparecemos
+
+```{r}
+#| label: paso9
+dd <- data.frame(
+  Fecha   = d$Fecha[-1],
+  dOMAB   = diff(d$lOMAB), dLABB = diff(d$lLABB), dNVDA = diff(d$lNVDA),
+  dUSDMXN = diff(d$lUSDMXN), dSPX = diff(d$lSPX), dTasa = diff(d$Tasa)
+)
+modelos_dif <- lapply(activos, function(a)
+  lm(as.formula(paste0("d", a, " ~ dUSDMXN + dSPX + dTasa")), data = dd))
+names(modelos_dif) <- activos
+
+T6  <- do.call(rbind, lapply(activos, function(a) tabla_coef(modelos_dif[[a]], a)))
+T6a <- tabla_ajuste(modelos_dif)
+
+equiv <- c(lUSDMXN = "dUSDMXN", lSPX = "dSPX", Tasa = "dTasa")
+T6b <- do.call(rbind, lapply(activos, function(a) {
+  sn  <- summary(modelos[[a]])$coefficients
+  sd_ <- summary(modelos_dif[[a]])$coefficients
+  do.call(rbind, lapply(names(equiv), function(v) {
+    cn <- unname(sn[v, 1]);  pn <- unname(sn[v, 4])
+    cd <- unname(sd_[equiv[[v]], 1]); pd <- unname(sd_[equiv[[v]], 4])
+    data.frame(Activo = a, Factor = v, Coef_niveles = cn, p_niveles = pn,
+               Coef_dif = cd, p_dif = pd,
+               Se_sostiene = (pn < alfa) & (pd < alfa) & (sign(cn) == sign(cd)))
+  }))
+}))
+kable(T6,  digits = 4, caption = "T6. Modelos en variaciones mensuales")
+kable(T6a, digits = 4, caption = "T6a. Ajuste (variaciones)")
+kable(T6b, digits = 4, caption = "T6b. ¿Se sostiene el resultado de niveles?")
+```
+
+# ¿Qué descubrimos en cada acción?
+
+1.  OMAB – Grupo Aeroportuario del Centro Norte
+
+Sin resultados significativos al 5%
+
+- dUSDMXN: coeficiente de -0.5399 y valor p de 0.2924.
+
+- dSPX: coeficiente de -0.5910 y valor p de 0.0966.
+
+- dTasa: coeficiente de -0.0023 y valor p de 0.9554.
+
+¿Qué significa?
+
+Ninguna variable alcanza significancia estadística al 5%. Sin embargo, el S&P 500 presenta una relación negativa estimada y una significancia débil al 10%, pero no es suficiente para considerarla significativa al 5%.
+
+2.  LABB – Genomma Lab
+
+Sin resultados significativos
+
+- dUSDMXN: coeficiente de +1.1585 y valor p de 0.1776.
+
+- dSPX: coeficiente de -0.0858 y valor p de 0.8800.
+
+- dTasa: coeficiente de +0.0538 y valor p de 0.4392.
+
+¿Qué significa?
+
+Ninguno de los tres factores tiene una relación estadísticamente significativa con las variaciones mensuales de Genomma Lab.
+
+Aunque el dólar y la tasa tienen coeficientes positivos, no podemos asegurar que realmente exista esa relación.
+
+3.  NVDA – NVIDIA
+
+Un resultado significativo
+
+- dUSDMXN: coeficiente de +0.1700 y valor p de 0.8062.
+
+- dSPX: coeficiente de +1.6969 y valor p de 0.0017.
+
+- dTasa: coeficiente de +0.0764 y valor p de 0.1900.
+
+¿Qué significa?
+
+Aquí encontramos algo interesante: el S&P 500 tiene una relación positiva y estadísticamente significativa con las variaciones mensuales de NVIDIA.
+
+Esto quiere decir que cuando aumenta el S&P 500, NVIDIA tiende a presentar también un aumento en sus variaciones mensuales, manteniendo constantes las demás variables.
+
+La conclusión principal es que, al estudiar las variaciones mensuales, encontramos menos relaciones estadísticamente significativas que al estudiar los niveles de las variables.
+
+Solamente encontramos una relación significativa al 5%:
+
+# NVDA + dSPX
+
+Única relación significativa al 5%
+
+| Indicador   | Resultado |
+|-------------|-----------|
+| Coeficiente | +1.6969   |
+| Valor p     | 0.0017    |
+| IC inferior | 0.7274    |
+| IC superior | 2.6664    |
+
+Esto indica que NVIDIA presenta una relación positiva con las variaciones mensuales del S&P 500.
